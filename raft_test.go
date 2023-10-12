@@ -11,9 +11,10 @@ import (
 )
 
 type peer struct {
-	term    int
-	voteYes bool
-	err     error
+	term            int
+	voteYes         bool
+	requestDuration time.Duration
+	err             error
 }
 
 type fakeService struct {
@@ -25,6 +26,8 @@ func (f *fakeService) RequestVotes(term int, peerID string) (*VoteResponse, erro
 	if !ok {
 		return nil, fmt.Errorf("peer not found")
 	}
+
+	time.Sleep(peer.requestDuration)
 
 	if peer.err != nil {
 		return nil, peer.err
@@ -48,7 +51,7 @@ func (f *fakeService) AppendEntries(term, id int, peerID string) (int, error) {
 func TestElectionTimerStateHearsFromLeaderWithinTime(t *testing.T) {
 	service := fakeService{}
 
-	raft, err := NewRaft(&service)
+	raft, err := NewRaft(&service, time.Second)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
@@ -72,7 +75,7 @@ func TestElectionTimerStateChangesMajorityVoteYes(t *testing.T) {
 		},
 	}
 
-	raft, err := NewRaft(&service)
+	raft, err := NewRaft(&service, time.Second)
 	require.NoError(t, err)
 
 	raft.leaderLastHeartbeat = time.Now().Add(-time.Second)
@@ -99,7 +102,7 @@ func TestElectionTimerStateMostOtherPeersVotesNo(t *testing.T) {
 		},
 	}
 
-	raft, err := NewRaft(&service)
+	raft, err := NewRaft(&service, time.Second)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
@@ -124,7 +127,7 @@ func TestElectionTimerStateAllOtherPeersVotesNo(t *testing.T) {
 		},
 	}
 
-	raft, err := NewRaft(&service)
+	raft, err := NewRaft(&service, time.Second)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
@@ -149,7 +152,7 @@ func TestElectionTimerStateOtherPeerHasHigherTerm(t *testing.T) {
 		},
 	}
 
-	raft, err := NewRaft(&service)
+	raft, err := NewRaft(&service, time.Second)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
@@ -169,4 +172,54 @@ func TestElectionTimerStateOtherPeerHasHigherTerm(t *testing.T) {
 	if raft.state != leaderState && raft.state != followerState {
 		t.Fatalf("expecting to be either a leader of follower but actually a '%s'", raft.state)
 	}
+}
+
+func TestElectionTimerStateOnePeerErrors(t *testing.T) {
+	service := fakeService{
+		peers: map[string]peer{
+			"peer1": peer{err: fmt.Errorf("something bad happened")},
+			"peer2": peer{term: 0, voteYes: true},
+		},
+	}
+
+	raft, err := NewRaft(&service, time.Second)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
+	defer cancel()
+
+	raft.leaderLastHeartbeat = time.Now().Add(-time.Second)
+	raft.peers = []string{"peer1", "peer2"}
+
+	go raft.electionTimer(ctx)
+
+	<-ctx.Done()
+
+	// check the state is leader
+	assert.Equal(t, leaderState, raft.state)
+}
+
+func TestElectionTimerStateOneTakesTooLongToRespond(t *testing.T) {
+	service := fakeService{
+		peers: map[string]peer{
+			"peer1": peer{requestDuration: time.Second * 10},
+			"peer2": peer{term: 0, voteYes: true},
+		},
+	}
+
+	raft, err := NewRaft(&service, time.Second)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
+	defer cancel()
+
+	raft.leaderLastHeartbeat = time.Now().Add(-time.Second)
+	raft.peers = []string{"peer1", "peer2"}
+
+	go raft.electionTimer(ctx)
+
+	<-ctx.Done()
+
+	// check the state is leader
+	assert.Equal(t, leaderState, raft.state)
 }

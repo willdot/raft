@@ -36,15 +36,17 @@ type Raft struct {
 
 	leaderLastHeartbeat time.Time
 
-	state state
-	term  int
+	state        state
+	term         int
+	waitForVotes time.Duration
 }
 
-func NewRaft(s Service) (*Raft, error) {
+func NewRaft(s Service, waitForVotes time.Duration) (*Raft, error) {
 	r := Raft{
-		service: s,
-		state:   followerState,
-		term:    0,
+		service:      s,
+		state:        followerState,
+		term:         0,
+		waitForVotes: waitForVotes,
 	}
 
 	return &r, nil
@@ -66,7 +68,7 @@ func (r *Raft) electionTimer(ctx context.Context) error {
 		select {
 		case <-timer.C:
 			if r.shouldStartElection(electionTimeout) {
-				r.startElection()
+				r.startElection(ctx)
 			}
 
 		case <-ctx.Done():
@@ -104,64 +106,66 @@ func calculateRequiredVotes(numberOfPeers int) int {
 	return ((numberOfPeers + 1) / 2) + 1
 }
 
-func (r *Raft) startElection() {
+func (r *Raft) getVoteFromPeer(peer string, votes chan<- *VoteResponse) {
+	result, err := r.service.RequestVotes(r.term, peer)
+	if err != nil {
+		fmt.Printf("failed to request votes: %e", err)
+	}
+
+	votes <- result
+}
+
+func (r *Raft) startElection(ctx context.Context) {
 	r.updateState(candidateState)
 	r.term = r.term + 1
 
-	// we start at 1 because we vote for ourselves
-	yesVoteCount := 1
-	votesReceived := 0
-	requiredVotes := calculateRequiredVotes(len(r.peers))
+	votesChan := make(chan *VoteResponse)
 
 	for _, peer := range r.peers {
-		go func(peer string) {
-			defer func() {
-				// if we've received all the votes now, check the results and update to either leader or follower
-				if votesReceived != len(r.peers) {
-					return
-				}
-
-				if yesVoteCount >= requiredVotes {
-					r.updateState(leaderState)
-					return
-				}
-				r.updateState(followerState)
-			}()
-
-			result, err := r.service.RequestVotes(r.term, peer)
-			votesReceived++
-			if err != nil {
-				r.updateState(followerState)
-
-				fmt.Printf("failed to request votes: $%s\n", err)
-				return
-			}
-
-			// while waiting for the result, if for some reason we are no longer
-			// a candidate then abort
-			if r.getState() != candidateState {
-				return
-			}
-
-			// if the peer term is higher, it will be leader
-			if result.term > r.term {
-				r.updateState(followerState)
-				return
-			}
-
-			if !result.voteResult {
-				return
-			}
-
-			yesVoteCount++
-
-			// if we have enough votes we are leader
-			if yesVoteCount >= requiredVotes {
-				r.updateState(leaderState)
-				return
-			}
-		}(peer)
+		peer := peer
+		go r.getVoteFromPeer(peer, votesChan)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, r.waitForVotes)
+	defer cancel()
+
+	// get as many votes as we can before the timeout
+	votes := make([]*VoteResponse, 0, len(r.peers))
+	for i := 0; i < len(r.peers); i++ {
+		select {
+		case vote := <-votesChan:
+			if vote != nil {
+				votes = append(votes, vote)
+			}
+		case <-ctx.Done():
+			// timed out, see if we have enough votes or wait for the next election
+			break
+		}
+	}
+
+	// now work out the results based on the votes we have
+	requiredVotes := calculateRequiredVotes(len(r.peers))
+	// we vote for ourselves so always start with 1 vote
+	yesVotes := 1
+	for _, vote := range votes {
+		if vote.term > r.term {
+			// another peer has a higher term so we can't be leader
+			r.updateState(followerState)
+			return
+		}
+		if vote.voteResult {
+			yesVotes++
+		}
+	}
+
+	// if we have enough votes then update to leader
+	if yesVotes >= requiredVotes {
+		r.updateState(leaderState)
+		return
+	}
+
+	// we didn't get enough votes so back to being a follower
+	r.updateState(followerState)
 }
 
 func (r *Raft) updateState(state state) {

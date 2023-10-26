@@ -163,7 +163,7 @@ func calculateRequiredVotes(numberOfPeers int) int {
 	// 3 nodes requires 2 votes
 	// 4 nodes requires 3 votes
 	// 5 nodes requires 3 votes
-	// 6 nodes requires 5 votes
+	// 6 nodes requires 4 votes
 
 	return ((numberOfPeers + 1) / 2) + 1
 }

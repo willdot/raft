@@ -3,8 +3,8 @@ module github.com/willdot/raft
 go 1.21.0
 
 require (
+	github.com/gorilla/mux v1.8.0
 	github.com/stretchr/testify v1.8.4
-	golang.org/x/sync v0.4.0
 )
 
 require (

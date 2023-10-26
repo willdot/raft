@@ -9,8 +9,8 @@ import (
 )
 
 type VoteResponse struct {
-	term       int
-	voteResult bool
+	Term       int
+	VoteResult bool
 }
 
 type state string
@@ -23,31 +23,48 @@ const (
 
 type Service interface {
 	// Send a term, recieve a term, if the vote was given or an error
-	RequestVotes(term int, peerID string) (*VoteResponse, error)
+	RequestVotes(term int, peer string) (*VoteResponse, error)
 	// Send the current term and ID, reveive a term or an error
-	AppendEntries(term, id int, peerID string) (int, error)
+	AppendEntries(term, id int, peer Peer) (int, error)
+	// Send heartbeats to all peers
+	SendHeartbeats(term int, peers []string)
+}
+
+type Peer struct {
+	Addr string
 }
 
 type Raft struct {
 	service Service
-	mu      sync.Mutex
 
-	peers []string
+	peers   map[string]struct{}
+	peersMu sync.Mutex
 
 	leaderLastHeartbeat time.Time
 
 	state        state
+	stateMu      sync.Mutex
 	term         int
 	waitForVotes time.Duration
 }
 
-func NewRaft(s Service, waitForVotes time.Duration) (*Raft, error) {
-	r := Raft{
-		service:      s,
-		state:        followerState,
-		term:         0,
-		waitForVotes: waitForVotes,
+func NewRaft(s Service, waitForVotes time.Duration, peers []string) (*Raft, error) {
+	p := make(map[string]struct{})
+
+	for _, peer := range peers {
+		p[peer] = struct{}{}
 	}
+
+	r := Raft{
+		service:             s,
+		state:               followerState,
+		term:                0,
+		waitForVotes:        waitForVotes,
+		leaderLastHeartbeat: time.Now(),
+		peers:               p,
+	}
+
+	go r.electionTimer(context.Background())
 
 	return &r, nil
 }
@@ -58,28 +75,72 @@ func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(rand.Intn(max-min+1)+min)
 }
 
-func (r *Raft) electionTimer(ctx context.Context) error {
+func (r *Raft) Vote(propsedTerm int) VoteResponse {
+	res := VoteResponse{
+		Term: r.term,
+	}
+
+	if propsedTerm > r.term {
+		res.VoteResult = true
+	}
+
+	return res
+}
+
+func (r *Raft) AddPeer(peer Peer) {
+	r.peersMu.Lock()
+	defer r.peersMu.Unlock()
+
+	r.peers[peer.Addr] = struct{}{}
+}
+
+func (r *Raft) getPeers() map[string]struct{} {
+	r.peersMu.Lock()
+	defer r.peersMu.Unlock()
+
+	return r.peers
+}
+
+func (r *Raft) HeartbeatReceived(term int) {
+	r.leaderLastHeartbeat = time.Now()
+
+	// if the term of the heartbeat is higher, update our term to be the same and if
+	// we are a leader, step down as a new leader has been elected
+	if term > r.term {
+		r.term = term
+		if r.getState() == leaderState {
+			r.updateState(followerState)
+		}
+	}
+}
+
+func (r *Raft) electionTimer(ctx context.Context) {
 	electionTimeout := getElectionTimeout()
 
-	timer := time.NewTimer(time.Millisecond * 100)
+	timerDuration := time.Millisecond * 100
+
+	timer := time.NewTimer(timerDuration)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-timer.C:
+			timer.Reset(timerDuration)
 			if r.shouldStartElection(electionTimeout) {
+				fmt.Println("starting election")
 				r.startElection(ctx)
 			}
 
 		case <-ctx.Done():
-			return ctx.Err()
+			fmt.Println("context cancelled, stopping election timer")
+			return
 		}
 	}
 }
 
 func (r *Raft) shouldStartElection(electionTimeout time.Duration) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 
 	currentState := r.state
 
@@ -103,13 +164,14 @@ func calculateRequiredVotes(numberOfPeers int) int {
 	// 4 nodes requires 3 votes
 	// 5 nodes requires 3 votes
 	// 6 nodes requires 5 votes
+
 	return ((numberOfPeers + 1) / 2) + 1
 }
 
 func (r *Raft) getVoteFromPeer(peer string, votes chan<- *VoteResponse) {
 	result, err := r.service.RequestVotes(r.term, peer)
 	if err != nil {
-		fmt.Printf("failed to request votes: %e", err)
+		fmt.Printf("failed to request votes: %s\n", err)
 	}
 
 	votes <- result
@@ -121,7 +183,9 @@ func (r *Raft) startElection(ctx context.Context) {
 
 	votesChan := make(chan *VoteResponse)
 
-	for _, peer := range r.peers {
+	peers := r.getPeers()
+
+	for peer := range peers {
 		peer := peer
 		go r.getVoteFromPeer(peer, votesChan)
 	}
@@ -139,28 +203,34 @@ func (r *Raft) startElection(ctx context.Context) {
 			}
 		case <-ctx.Done():
 			// timed out, see if we have enough votes or wait for the next election
+			fmt.Println("timed out waiting for votes")
 			break
 		}
 	}
+
+	fmt.Printf("got '%d' votes from peers\n", len(votes))
 
 	// now work out the results based on the votes we have
 	requiredVotes := calculateRequiredVotes(len(r.peers))
 	// we vote for ourselves so always start with 1 vote
 	yesVotes := 1
 	for _, vote := range votes {
-		if vote.term > r.term {
+		if vote.Term > r.term {
 			// another peer has a higher term so we can't be leader
 			r.updateState(followerState)
 			return
 		}
-		if vote.voteResult {
+		if vote.VoteResult {
 			yesVotes++
 		}
 	}
 
 	// if we have enough votes then update to leader
+	fmt.Printf("required votes '%d' and have '%d' votes\n", requiredVotes, yesVotes)
 	if yesVotes >= requiredVotes {
 		r.updateState(leaderState)
+
+		go r.SendHeartbeats()
 		return
 	}
 
@@ -168,14 +238,37 @@ func (r *Raft) startElection(ctx context.Context) {
 	r.updateState(followerState)
 }
 
+func (r *Raft) SendHeartbeats() {
+	for {
+		if r.getState() != leaderState {
+			break
+		}
+
+		peers := r.getPeers()
+
+		peersToSendTo := make([]string, 0, len(peers))
+		for peer := range peers {
+			peersToSendTo = append(peersToSendTo, peer)
+		}
+
+		// TODO: some sort of cancellation is required
+		r.service.SendHeartbeats(r.term, peersToSendTo)
+
+		time.Sleep(time.Millisecond * 10)
+	}
+}
+
 func (r *Raft) updateState(state state) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
+	fmt.Printf("updating state from '%s' to '%s'\n", r.state, state)
+
 	r.state = state
 }
 
 func (r *Raft) getState() state {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 	return r.state
 }

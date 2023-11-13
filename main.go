@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/willdot/raft/raft"
@@ -18,7 +19,12 @@ func (i *arrayFlags) String() string {
 }
 
 func (i *arrayFlags) Set(value string) error {
-	*i = append(*i, value)
+	allVals := strings.Split(value, ",")
+
+	for _, val := range allVals {
+		*i = append(*i, strings.TrimSpace(val))
+	}
+
 	return nil
 }
 
@@ -43,7 +49,7 @@ func main() {
 		fmt.Printf("error adding peers: %s\n", err)
 	}
 
-	raft, err := raft.NewRaft(&service, time.Second, peers)
+	raft, err := raft.NewRaft(service, time.Second, peers)
 	if err != nil {
 		log.Fatal(err)
 	}

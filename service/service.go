@@ -2,25 +2,18 @@ package service
 
 import (
 	"fmt"
-	"net/http"
 	"net/rpc"
 	"strings"
-	"time"
 
 	"github.com/willdot/raft/raft"
 )
 
 type Service struct {
-	httpClient http.Client
 	serverAddr string
 }
 
-func NewService(serverAddr string) Service {
-	client := http.Client{
-		Timeout: time.Second * 10,
-	}
-	return Service{
-		httpClient: client,
+func NewService(serverAddr string) *Service {
+	return &Service{
 		serverAddr: serverAddr,
 	}
 }
@@ -96,7 +89,6 @@ func (s *Service) AddPeer(peers []string) error {
 			return err
 		}
 
-		// TODO: Peer ID - what do we want to use it for if anything?
 		err = client.Call("RPCServer.AddPeer", AddPeerRequest{Addr: s.serverAddr}, nil)
 		if err != nil {
 			return err
